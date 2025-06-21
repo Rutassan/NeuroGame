@@ -3,3 +3,4 @@ name = "kernel"
 edition = "2021"
 
 [dependencies]
+game = { path = "../game" }

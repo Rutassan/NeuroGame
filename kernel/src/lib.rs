@@ -1,7 +1,10 @@
 #![no_std]
 #![no_main]
 
+extern crate game;
+
 use core::panic::PanicInfo;
+use core::arch::asm;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -10,6 +13,10 @@ fn panic(_info: &PanicInfo) -> ! {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // пока просто зациклиться:
-    loop {}
+    game::init();
+    loop {
+        game::update(0.016);
+        game::render();
+        unsafe { asm!("hlt"); }
+    }
 }

@@ -51,15 +51,17 @@ pub fn map_guest_memory(vm_fd: i32, size: usize) -> Result<*mut u8, String> {
 
 const KVM_GET_VCPU_MMAP_SIZE: usize = 0xAE04;
 
+/// Возвращает размер области, которую нужно mmap для VCPU.
 pub fn get_run_size(kvm_fd: i32) -> Result<usize, String> {
     let size = unsafe { sys_ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0) };
     if size < 0 {
-        Err("Не удалось получить размер KVM_RUN mmap".to_string())
+        Err(format!("KVM_GET_VCPU_MMAP_SIZE failed: {}", size))
     } else {
         Ok(size as usize)
     }
 }
 
+/// Мапит область управления VCPU размером `size`.
 pub fn map_run_area(vcpu_fd: i32, size: usize) -> Result<*mut u8, String> {
     let ptr = unsafe {
         sys_mmap(
@@ -72,7 +74,7 @@ pub fn map_run_area(vcpu_fd: i32, size: usize) -> Result<*mut u8, String> {
         )
     };
     if ptr.is_null() {
-        Err("Не удалось mmap KVM_RUN область".to_string())
+        Err("mmap run area failed".into())
     } else {
         Ok(ptr)
     }
@@ -103,9 +105,12 @@ pub fn run_vcpu(vmm: &Vmm) -> Result<(), String> {
     }
 }
 
+const KVM_GET_SREGS: usize = 0x8138AE80;
+const KVM_SET_SREGS: usize = 0x4138AE81;
+const KVM_SET_REGS:  usize = 0x4090AE82;
+
 #[repr(C)]
 struct kvm_sregs {
-    // ...минимальный набор полей для sregs, только cs
     _pad1: [u8; 0x18],
     cs: kvm_segment,
     _pad2: [u8; 0x2d0],
@@ -150,10 +155,6 @@ struct kvm_regs {
     rflags: u64,
 }
 
-const KVM_GET_SREGS: usize = 0x8138ae83;
-const KVM_SET_SREGS: usize = 0x4138ae84;
-const KVM_SET_REGS: usize  = 0x4090ae82;
-
 pub fn setup_sregs(vcpu_fd: i32) -> Result<(), String> {
     let mut sregs = kvm_sregs {
         _pad1: [0; 0x18],
@@ -179,6 +180,7 @@ pub fn setup_sregs(vcpu_fd: i32) -> Result<(), String> {
         return Err("KVM_GET_SREGS failed".to_string());
     }
     sregs.cs.base = 0;
+    sregs.cs.selector = 0;
     let ret = unsafe { sys_ioctl(vcpu_fd, KVM_SET_SREGS, &sregs as *const _ as usize) };
     if ret < 0 {
         Err("KVM_SET_SREGS failed".to_string())
@@ -206,7 +208,7 @@ pub fn setup_regs(vcpu_fd: i32, entry: u64, stack: u64) -> Result<(), String> {
         r14: 0,
         r15: 0,
         rip: entry,
-        rflags: 2,
+        rflags: 0x2,
     };
     let ret = unsafe { sys_ioctl(vcpu_fd, KVM_SET_REGS, &regs as *const _ as usize) };
     if ret < 0 {
@@ -216,16 +218,70 @@ pub fn setup_regs(vcpu_fd: i32, entry: u64, stack: u64) -> Result<(), String> {
     }
 }
 
+/// Загружает файл по пути `path` в память гостя.
+pub fn load_guest_kernel(vm: &Vmm, path: &str, guest_mem_size: usize) -> Result<(), String> {
+    let data = std::fs::read(path).map_err(|e| format!("Ошибка чтения ядра: {}", e))?;
+    let len = data.len().min(guest_mem_size);
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), vm.guest_mem, len);
+    }
+    Ok(())
+}
+
 use crate::syscall::*;
 
+const KVM_EXIT_IO: u32  = 2;
+const KVM_EXIT_HLT: u32 = 5;
+
+#[repr(C)]
+struct kvm_run_io {
+    direction: u8,
+    size: u8,
+    port: u16,
+    count: u32,
+    data_offset: u64,
+    _pad: [u8; 40],
+}
+
+const FRAMEBUFFER_ADDR: usize = 0x2000_0000;
+const WIDTH: usize = 640;
+const HEIGHT: usize = 480;
+
+/// Дампит содержимое guest framebuffer в файл "frame_<num>.ppm"
+fn dump_frame(vm: &Vmm, frame_num: usize) -> Result<(), String> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let fb_ptr = unsafe { vm.guest_mem.add(FRAMEBUFFER_ADDR) } as *const u8;
+    let path = format!("frames/frame_{}.ppm", frame_num);
+    let mut file = File::create(&path).map_err(|e| e.to_string())?;
+    file.write_all(format!("P6\n{} {}\n255\n", WIDTH, HEIGHT).as_bytes())
+        .map_err(|e| e.to_string())?;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let off = (y * WIDTH + x) * 4;
+            let r = unsafe { *fb_ptr.add(off) };
+            let g = unsafe { *fb_ptr.add(off + 1) };
+            let b = unsafe { *fb_ptr.add(off + 2) };
+            file.write_all(&[r, g, b]).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn main() {
-    match create_vm(0x400000) {
+    const GUEST_MEM_SIZE: usize = 0x400000;
+    match create_vm(GUEST_MEM_SIZE) {
         Ok(vm) => {
-            let run_size = match get_run_size(vm.kvm_fd) {
+            if let Err(e) = load_guest_kernel(&vm, "kernel.bin", GUEST_MEM_SIZE) {
+                eprintln!("Ошибка загрузки ядра: {}", e);
+                return;
+            }
+            let size = match get_run_size(vm.kvm_fd) {
                 Ok(sz) => sz,
                 Err(e) => { eprintln!("Ошибка get_run_size: {}", e); return; }
             };
-            let run_ptr = match map_run_area(vm.vcpu_fd, run_size) {
+            let run_ptr = match map_run_area(vm.vcpu_fd, size) {
                 Ok(ptr) => ptr,
                 Err(e) => { eprintln!("Ошибка map_run_area: {}", e); return; }
             };
@@ -237,14 +293,39 @@ fn main() {
                 eprintln!("Ошибка setup_regs: {}", e);
                 return;
             }
-            println!("Starting VCPU...");
+            println!("Запускаем VCPU");
+            let mut frame_count = 0;
             loop {
                 if let Err(e) = run_vcpu(&vm) {
                     eprintln!("Ошибка run_vcpu: {}", e);
                     break;
                 }
-                let exit_reason = unsafe { *(run_ptr as *const u32).offset(0) };
-                println!("Exit reason: {:?}", exit_reason);
+                let reason = unsafe { *(run_ptr as *const u32) };
+                match reason {
+                    KVM_EXIT_IO => {
+                        let io_ptr = unsafe { run_ptr.add(0x10) as *const kvm_run_io };
+                        let io = unsafe { &*io_ptr };
+                        if io.direction == 0 {
+                            let data_ptr = unsafe { run_ptr.add(io.data_offset as usize) };
+                            for i in 0..(io.size as usize * io.count as usize) {
+                                let byte = unsafe { *data_ptr.add(i) };
+                                print!("{}", byte as char);
+                            }
+                        }
+                    }
+                    KVM_EXIT_HLT => {
+                        if let Err(e) = dump_frame(&vm, frame_count) {
+                            eprintln!("Ошибка сохранения кадра: {}", e);
+                            break;
+                        }
+                        frame_count += 1;
+                        continue;
+                    }
+                    _ => {
+                        println!("Unhandled exit reason: {}", reason);
+                        break;
+                    }
+                }
             }
         }
         Err(err) => {
