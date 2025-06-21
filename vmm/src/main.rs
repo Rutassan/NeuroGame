@@ -1,52 +1,71 @@
 mod syscall;
+mod kvmproxy;
 
+use crate::kvmproxy::KvmProxy;
 use crate::syscall::{sys_ioctl, sys_mmap, sys_open, KVM_CREATE_VM, KVM_CREATE_VCPU, MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE};
 use core::ptr;
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 
-pub fn open_kvm() -> Result<i32, String> {
-    let path = b"/dev/kvm\0";
-    let fd = unsafe { sys_open(path.as_ptr(), O_RDWR) };
-    if fd < 0 {
-        Err("Failed to open /dev/kvm".to_string())
-    } else {
-        Ok(fd)
-    }
+pub fn open_kvm() -> Result<KvmProxy, String> {
+    KvmProxy::connect()
 }
 
-pub fn create_vm_fd(kvm_fd: i32) -> Result<i32, String> {
-    let vm_fd = unsafe { sys_ioctl(kvm_fd, KVM_CREATE_VM, 0) };
-    if vm_fd < 0 {
-        Err("Failed to create VM fd".to_string())
-    } else {
-        Ok(vm_fd)
-    }
+pub fn create_vm_fd(proxy: &mut KvmProxy) -> Result<u64, String> {
+    // KVM_CREATE_VM: только req, без arg, ответ — 8 байт (u64 id)
+    let resp = proxy.ioctl(0xAE01, None, 8)?;
+    Ok(u64::from_le_bytes(resp.try_into().unwrap()))
 }
 
-pub fn create_vcpu_fd(vm_fd: i32) -> Result<i32, String> {
-    let vcpu_fd = unsafe { sys_ioctl(vm_fd, KVM_CREATE_VCPU, 0) };
-    if vcpu_fd < 0 {
-        Err("Failed to create VCPU fd".to_string())
-    } else {
-        Ok(vcpu_fd)
-    }
+pub fn create_vcpu_fd(proxy: &mut KvmProxy) -> Result<u64, String> {
+    // KVM_CREATE_VCPU: только req, без arg, ответ — 8 байт (u64 id)
+    let resp = proxy.ioctl(0xAE41, None, 8)?;
+    Ok(u64::from_le_bytes(resp.try_into().unwrap()))
+}
+
+const MAP_ANONYMOUS: i32 = 0x20;
+const KVM_SET_USER_MEMORY_REGION: usize = 0x4020ae46;
+
+#[repr(C)]
+struct kvm_userspace_memory_region {
+    slot: u32,
+    flags: u32,
+    guest_phys_addr: u64,
+    memory_size: u64,
+    userspace_addr: u64,
 }
 
 pub fn map_guest_memory(vm_fd: i32, size: usize) -> Result<*mut u8, String> {
+    // 1. mmap анонимную память
     let ptr = unsafe {
         sys_mmap(
-            ptr::null_mut(),
+            core::ptr::null_mut(),
             size,
             PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            vm_fd,
+            MAP_SHARED | MAP_ANONYMOUS,
+            -1, // fd = -1
             0,
         )
     };
-    if ptr.is_null() {
-        Err("Failed to mmap guest memory".to_string())
-    } else {
-        Ok(ptr)
+    if ptr.is_null() || (ptr as isize) < 0 {
+        eprintln!("[vmm] sys_mmap вернул ошибку: ptr = {:p} (as isize: {})", ptr, ptr as isize);
+        return Err(format!("sys_mmap вернул ошибку: ptr = {:p} (as isize: {})", ptr, ptr as isize));
     }
+    // 2. Зарегистрировать память в KVM
+    // Изменён guest_phys_addr на 0x100000 (1 МБ)
+    let region = kvm_userspace_memory_region {
+        slot: 0,
+        flags: 0,
+        guest_phys_addr: 0x100000, // стандартный адрес загрузки ядра x86_64
+        memory_size: size as u64,
+        userspace_addr: ptr as u64,
+    };
+    let ret = unsafe { sys_ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region as *const _ as usize) };
+    if ret < 0 {
+        eprintln!("[vmm] KVM_SET_USER_MEMORY_REGION failed: {}", ret);
+        return Err(format!("KVM_SET_USER_MEMORY_REGION failed: {}", ret));
+    }
+    Ok(ptr)
 }
 
 const KVM_GET_VCPU_MMAP_SIZE: usize = 0xAE04;
@@ -81,56 +100,78 @@ pub fn map_run_area(vcpu_fd: i32, size: usize) -> Result<*mut u8, String> {
 }
 
 pub struct Vmm {
-    pub kvm_fd: i32,
-    pub vm_fd: i32,
-    pub vcpu_fd: i32,
-    pub guest_mem: *mut u8,
+    pub proxy: KvmProxy,
+    pub vm_id: u64,
+    pub vcpu_id: u64,
+    pub guest_mem: Vec<u8>,
 }
+
+const KVM_CREATE_IRQCHIP: usize = 0xae60;
 
 pub fn create_vm(memory_size: usize) -> Result<Vmm, String> {
-    let kvm_fd = open_kvm()?;
-    let vm_fd = create_vm_fd(kvm_fd)?;
-    let vcpu_fd = create_vcpu_fd(vm_fd)?;
-    let guest_mem = map_guest_memory(vm_fd, memory_size)?;
-    Ok(Vmm { kvm_fd, vm_fd, vcpu_fd, guest_mem })
+    let mut proxy = open_kvm()?;
+    let vm_id = create_vm_fd(&mut proxy)?;
+    let vcpu_id = create_vcpu_fd(&mut proxy)?;
+    let guest_mem = vec![0u8; memory_size];
+    Ok(Vmm { proxy, vm_id, vcpu_id, guest_mem })
 }
 
-pub fn run_vcpu(vmm: &Vmm) -> Result<(), String> {
-    const KVM_RUN: usize = 0xAE80; // _IO(KVMIO, 0x80)
-    let ret = unsafe { sys_ioctl(vmm.vcpu_fd, KVM_RUN, 0) };
-    if ret < 0 {
-        Err("Не удалось запустить VCPU".to_string())
-    } else {
-        Ok(())
-    }
+pub fn run_vcpu(proxy: &mut KvmProxy, vcpu_id: u64) -> Result<(), String> {
+    // KVM_RUN: req, vcpu_id (8 байт), ответ — 4 байта exit_reason
+    let arg = vcpu_id.to_le_bytes();
+    let resp = proxy.ioctl(0xAE44, Some(&arg), 4)?;
+    let exit_reason = u32::from_le_bytes(resp.try_into().unwrap());
+    if exit_reason == 5 { Ok(()) } else { Err(format!("KVM_RUN exit_reason: {}", exit_reason)) }
 }
 
 const KVM_GET_SREGS: usize = 0x8138AE80;
 const KVM_SET_SREGS: usize = 0x4138AE81;
-const KVM_SET_REGS:  usize = 0x4090AE82;
+const KVM_GET_REGS: usize = 0x8090AE81;
 
-#[repr(C)]
-struct kvm_sregs {
-    _pad1: [u8; 0x18],
-    cs: kvm_segment,
-    _pad2: [u8; 0x2d0],
+#[repr(C, align(8))]
+pub struct kvm_segment {
+    pub base: u64,
+    pub limit: u32,
+    pub selector: u16,
+    pub type_: u8,
+    pub present: u8,
+    pub dpl: u8,
+    pub db: u8,
+    pub s: u8,
+    pub l: u8,
+    pub g: u8,
+    pub avl: u8,
+    pub unusable: u8,
+    pub padding: u8,
 }
 
-#[repr(C)]
-struct kvm_segment {
-    base: u64,
-    limit: u32,
-    selector: u16,
-    type_: u8,
-    present: u8,
-    dpl: u8,
-    db: u8,
-    s: u8,
-    l: u8,
-    g: u8,
-    avl: u8,
-    unusable: u8,
-    padding: u8,
+#[repr(C, align(8))]
+pub struct kvm_dtable {
+    pub base: u64,
+    pub limit: u16,
+    pub padding: [u16; 3],
+}
+
+#[repr(C, align(8))]
+pub struct kvm_sregs {
+    pub cs: kvm_segment,
+    pub ds: kvm_segment,
+    pub es: kvm_segment,
+    pub fs: kvm_segment,
+    pub gs: kvm_segment,
+    pub ss: kvm_segment,
+    pub tr: kvm_segment,
+    pub ldt: kvm_segment,
+    pub gdt: kvm_dtable,
+    pub idt: kvm_dtable,
+    pub cr0: u64,
+    pub cr2: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+    pub cr8: u64,
+    pub efer: u64,
+    pub apic_base: u64,
+    pub interrupt_bitmap: [u64; 4],
 }
 
 #[repr(C)]
@@ -155,76 +196,48 @@ struct kvm_regs {
     rflags: u64,
 }
 
-pub fn setup_sregs(vcpu_fd: i32) -> Result<(), String> {
-    let mut sregs = kvm_sregs {
-        _pad1: [0; 0x18],
-        cs: kvm_segment {
-            base: 0,
-            limit: 0xffff,
-            selector: 0,
-            type_: 0xb,
-            present: 1,
-            dpl: 0,
-            db: 0,
-            s: 1,
-            l: 1,
-            g: 1,
-            avl: 0,
-            unusable: 0,
-            padding: 0,
-        },
-        _pad2: [0; 0x2d0],
-    };
-    let ret = unsafe { sys_ioctl(vcpu_fd, KVM_GET_SREGS, &mut sregs as *mut _ as usize) };
-    if ret < 0 {
-        return Err("KVM_GET_SREGS failed".to_string());
-    }
-    sregs.cs.base = 0;
-    sregs.cs.selector = 0;
-    let ret = unsafe { sys_ioctl(vcpu_fd, KVM_SET_SREGS, &sregs as *const _ as usize) };
-    if ret < 0 {
-        Err("KVM_SET_SREGS failed".to_string())
-    } else {
-        Ok(())
-    }
+pub fn setup_sregs(proxy: &mut KvmProxy, vcpu_id: u64, sregs: &[u8]) -> Result<(), String> {
+    // KVM_SET_SREGS: req, vcpu_id (8 байт) + sregs (312 байт), ответ — 8 байт ack
+    let mut arg = vcpu_id.to_le_bytes().to_vec();
+    arg.extend_from_slice(sregs);
+    let resp = proxy.ioctl(0xAE82, Some(&arg), 8)?;
+    if resp[0] == 1 { Ok(()) } else { Err("KVM_SET_SREGS failed".to_string()) }
 }
 
-pub fn setup_regs(vcpu_fd: i32, entry: u64, stack: u64) -> Result<(), String> {
-    let regs = kvm_regs {
-        rax: 0,
-        rbx: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        rsp: stack,
-        rbp: 0,
-        r8: 0,
-        r9: 0,
-        r10: 0,
-        r11: 0,
-        r12: 0,
-        r13: 0,
-        r14: 0,
-        r15: 0,
-        rip: entry,
-        rflags: 0x2,
-    };
-    let ret = unsafe { sys_ioctl(vcpu_fd, KVM_SET_REGS, &regs as *const _ as usize) };
-    if ret < 0 {
-        Err("KVM_SET_REGS failed".to_string())
-    } else {
-        Ok(())
-    }
+pub fn setup_regs(proxy: &mut KvmProxy, vcpu_id: u64, regs: &[u8]) -> Result<(), String> {
+    // KVM_SET_REGS: req, vcpu_id (8 байт) + regs (184 байт), ответ — 8 байт ack
+    let mut arg = vcpu_id.to_le_bytes().to_vec();
+    arg.extend_from_slice(regs);
+    let resp = proxy.ioctl(0xAE80, Some(&arg), 8)?;
+    if resp[0] == 1 { Ok(()) } else { Err("KVM_SET_REGS failed".to_string()) }
 }
+
+pub fn get_sregs(proxy: &mut KvmProxy, vcpu_id: u64) -> Result<Vec<u8>, String> {
+    // KVM_GET_SREGS: req, vcpu_id (8 байт), ответ — 312 байт sregs
+    let arg = vcpu_id.to_le_bytes();
+    let resp = proxy.ioctl(0xAE80, Some(&arg), 312)?;
+    Ok(resp)
+}
+
+pub fn get_regs(proxy: &mut KvmProxy, vcpu_id: u64) -> Result<Vec<u8>, String> {
+    // KVM_GET_REGS: req, vcpu_id (8 байт), ответ — 184 байт regs
+    let arg = vcpu_id.to_le_bytes();
+    let resp = proxy.ioctl(0xAE81, Some(&arg), 184)?;
+    Ok(resp)
+}
+
+// Удалены дублирующиеся определения:
+// pub fn setup_sregs(proxy: &mut KvmProxy, vcpu_id: u64) -> Result<(), String> { ... }
+// pub fn setup_regs(proxy: &mut KvmProxy, vcpu_id: u64, entry: u64, stack: u64) -> Result<(), String> { ... }
+// Оставлены только новые версии с сигнатурами:
+// pub fn setup_sregs(proxy: &mut KvmProxy, vcpu_id: u64, sregs: &[u8]) -> Result<(), String>
+// pub fn setup_regs(proxy: &mut KvmProxy, vcpu_id: u64, regs: &[u8]) -> Result<(), String>
 
 /// Загружает файл по пути `path` в память гостя.
-pub fn load_guest_kernel(vm: &Vmm, path: &str, guest_mem_size: usize) -> Result<(), String> {
+pub fn load_guest_kernel(vm: &mut Vmm, path: &str, guest_mem_size: usize) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| format!("Ошибка чтения ядра: {}", e))?;
     let len = data.len().min(guest_mem_size);
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), vm.guest_mem, len);
-    }
+    vm.guest_mem[..len].copy_from_slice(&data[..len]);
     Ok(())
 }
 
@@ -251,85 +264,129 @@ const HEIGHT: usize = 480;
 fn dump_frame(vm: &Vmm, frame_num: usize) -> Result<(), String> {
     use std::fs::File;
     use std::io::Write;
-
-    let fb_ptr = unsafe { vm.guest_mem.add(FRAMEBUFFER_ADDR) } as *const u8;
+    let fb_offset = 0x2000_0000 - 0x100000;
+    let fb_size = 640 * 480 * 4;
+    if vm.guest_mem.len() < fb_offset + fb_size {
+        return Err("Framebuffer выходит за пределы выделенной памяти VM".to_string());
+    }
+    let fb_slice = &vm.guest_mem[fb_offset..fb_offset+fb_size];
     let path = format!("frames/frame_{}.ppm", frame_num);
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
-    file.write_all(format!("P6\n{} {}\n255\n", WIDTH, HEIGHT).as_bytes())
+    file.write_all(format!("P6\n{} {}\n255\n", 640, 480).as_bytes())
         .map_err(|e| e.to_string())?;
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let off = (y * WIDTH + x) * 4;
-            let r = unsafe { *fb_ptr.add(off) };
-            let g = unsafe { *fb_ptr.add(off + 1) };
-            let b = unsafe { *fb_ptr.add(off + 2) };
-            file.write_all(&[r, g, b]).map_err(|e| e.to_string())?;
-        }
+    for px in fb_slice.chunks(4) {
+        file.write_all(&px[0..3]).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
+// После KVM_RUN отправляем framebuffer в эмулятор
+pub fn send_framebuffer(vm: &Vmm) {
+    println!("[vmm] send_framebuffer: start");
+    let fb_offset = 0x2000_0000 - 0x100000;
+    let fb_size = 640 * 480 * 4;
+    let fb_slice = &vm.guest_mem[fb_offset..fb_offset+fb_size];
+    // Диагностика: дамп первых 64 байт framebuffer
+    let dump = fb_slice.iter().take(64).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+    println!("[vmm] framebuffer head (64): {} ({} bytes)", dump, fb_slice.len());
+    match std::os::unix::net::UnixStream::connect("/tmp/mykvm.sock") {
+        Ok(mut sock) => {
+            println!("[vmm] send_framebuffer: connected to mykvm.sock");
+            if let Err(e) = sock.write_all(b"FRAMEBUFFER") {
+                println!("[vmm] send_framebuffer: failed to send header: {}", e);
+                return;
+            }
+            println!("[vmm] send_framebuffer: header sent");
+            if let Err(e) = sock.write_all(fb_slice) {
+                println!("[vmm] send_framebuffer: failed to send data: {}", e);
+                return;
+            }
+            println!("[vmm] send_framebuffer: sent {} bytes", fb_slice.len());
+        }
+        Err(e) => {
+            println!("[vmm] send_framebuffer: failed to connect: {}", e);
+        }
+    }
+    println!("[vmm] send_framebuffer: finished");
+}
+
 fn main() {
-    const GUEST_MEM_SIZE: usize = 0x400000;
-    match create_vm(GUEST_MEM_SIZE) {
-        Ok(vm) => {
-            if let Err(e) = load_guest_kernel(&vm, "kernel.bin", GUEST_MEM_SIZE) {
-                eprintln!("Ошибка загрузки ядра: {}", e);
-                return;
-            }
-            let size = match get_run_size(vm.kvm_fd) {
-                Ok(sz) => sz,
-                Err(e) => { eprintln!("Ошибка get_run_size: {}", e); return; }
-            };
-            let run_ptr = match map_run_area(vm.vcpu_fd, size) {
-                Ok(ptr) => ptr,
-                Err(e) => { eprintln!("Ошибка map_run_area: {}", e); return; }
-            };
-            if let Err(e) = setup_sregs(vm.vcpu_fd) {
-                eprintln!("Ошибка setup_sregs: {}", e);
-                return;
-            }
-            if let Err(e) = setup_regs(vm.vcpu_fd, 0x100000, 0x200000) {
-                eprintln!("Ошибка setup_regs: {}", e);
-                return;
-            }
-            println!("Запускаем VCPU");
-            let mut frame_count = 0;
-            loop {
-                if let Err(e) = run_vcpu(&vm) {
-                    eprintln!("Ошибка run_vcpu: {}", e);
-                    break;
-                }
-                let reason = unsafe { *(run_ptr as *const u32) };
-                match reason {
-                    KVM_EXIT_IO => {
-                        let io_ptr = unsafe { run_ptr.add(0x10) as *const kvm_run_io };
-                        let io = unsafe { &*io_ptr };
-                        if io.direction == 0 {
-                            let data_ptr = unsafe { run_ptr.add(io.data_offset as usize) };
-                            for i in 0..(io.size as usize * io.count as usize) {
-                                let byte = unsafe { *data_ptr.add(i) };
-                                print!("{}", byte as char);
-                            }
-                        }
-                    }
-                    KVM_EXIT_HLT => {
-                        if let Err(e) = dump_frame(&vm, frame_count) {
-                            eprintln!("Ошибка сохранения кадра: {}", e);
-                            break;
-                        }
-                        frame_count += 1;
-                        continue;
-                    }
-                    _ => {
-                        println!("Unhandled exit reason: {}", reason);
-                        break;
-                    }
-                }
-            }
+    use core::mem::{size_of, align_of};
+    println!("[vmm] kvm_sregs size: {} align: {}", size_of::<kvm_sregs>(), align_of::<kvm_sregs>());
+    println!("[vmm] kvm_segment size: {} align: {}", size_of::<kvm_segment>(), align_of::<kvm_segment>());
+
+    let kernel_path = "../kernel/target/x86_64-unknown-none/debug/kernel";
+    let memory_size = 0x20200000;
+    println!("[vmm] before create_vm");
+    let mut vmm = match create_vm(memory_size) {
+        Ok(vmm) => vmm,
+        Err(e) => {
+            eprintln!("[vmm] create_vm error: {}", e);
+            return;
         }
-        Err(err) => {
-            eprintln!("Ошибка при создании VM: {}", err);
+    };
+    println!("[vmm] after create_vm");
+    if let Err(e) = load_guest_kernel(&mut vmm, kernel_path, memory_size) {
+        eprintln!("[vmm] load_guest_kernel error: {}", e);
+    }
+    println!("[vmm] after load_guest_kernel");
+    use std::time::Instant;
+    let start_time = Instant::now();
+    let timeout = std::time::Duration::from_secs(10); // 10 секунд
+    let mut sregs = match get_sregs(&mut vmm.proxy, vmm.vcpu_id) {
+        Ok(s) => {
+            println!("[vmm] get_sregs: успешно получено {} байт", s.len());
+            s
+        },
+        Err(e) => {
+            eprintln!("[vmm] get_sregs error: {}", e);
+            vec![0u8; 312]
         }
+    };
+    let mut regs = match get_regs(&mut vmm.proxy, vmm.vcpu_id) {
+        Ok(r) => {
+            println!("[vmm] get_regs: успешно получено {} байт", r.len());
+            r
+        },
+        Err(e) => {
+            eprintln!("[vmm] get_regs error: {}", e);
+            vec![0u8; 184]
+        }
+    };
+
+    for frame in 0..300 {
+        if start_time.elapsed() > timeout {
+            println!("[vmm] Таймаут: выполнение завершено через 10 секунд");
+            break;
+        }
+        println!("[vmm] === FRAME {} ===", frame);
+        println!("[vmm] before setup_sregs");
+        let sregs_result = setup_sregs(&mut vmm.proxy, vmm.vcpu_id, &sregs);
+        if let Err(e) = &sregs_result {
+            eprintln!("[vmm] setup_sregs error: {}", e);
+        } else {
+            println!("[vmm] setup_sregs: ok");
+        }
+        println!("[vmm] after setup_sregs");
+        println!("[vmm] before setup_regs");
+        let regs_result = setup_regs(&mut vmm.proxy, vmm.vcpu_id, &regs);
+        if let Err(e) = &regs_result {
+            eprintln!("[vmm] setup_regs error: {}", e);
+        } else {
+            println!("[vmm] setup_regs: ok");
+        }
+        println!("[vmm] after setup_regs");
+        println!("[vmm] before run_vcpu");
+        let run_result = run_vcpu(&mut vmm.proxy, vmm.vcpu_id);
+        if let Err(e) = &run_result {
+            eprintln!("[vmm] run_vcpu error: {}", e);
+        } else {
+            println!("[vmm] run_vcpu: ok");
+        }
+        println!("[vmm] after run_vcpu");
+        println!("[vmm] before send_framebuffer");
+        send_framebuffer(&vmm);
+        println!("[vmm] after send_framebuffer");
+        std::thread::sleep(std::time::Duration::from_millis(40));
     }
 }

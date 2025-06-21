@@ -2,5 +2,12 @@
 name = "kernel"
 edition = "2021"
 
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
 [dependencies]
 game = { path = "../game" }

@@ -1,0 +1,4 @@
+[vmm] kvm_sregs size: 312 align: 8
+[vmm] kvm_segment size: 24 align: 8
+[vmm] before create_vm
+[vmm] create_vm error: Failed to connect to mykvm.sock: No such file or directory (os error 2)
